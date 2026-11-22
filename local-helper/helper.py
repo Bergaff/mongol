@@ -1,8 +1,9 @@
-"""Local PDF importer. Binds only to loopback; does not expose stored text via HTTP."""
+"""Local PDF library. Only the authorized site can read imported pages over loopback."""
 import argparse
 import hashlib
 import io
 import json
+import re
 import secrets
 import sys
 from datetime import datetime, timezone
@@ -59,9 +60,37 @@ def run():
         def do_GET(self):
             if not self.authorized():
                 return self.respond(403, {'error': 'Нет доступа'})
-            if self.path != '/health':
-                return self.respond(404, {'error': 'Не найдено'})
-            self.respond(200, {'ok': True})
+            parsed = urlparse(self.path)
+            if parsed.path == '/health':
+                return self.respond(200, {'ok': True})
+            if parsed.path == '/library':
+                books = []
+                for path in sorted(DATA_DIR.glob('*.json')):
+                    if not re.fullmatch(r'[0-9a-f]{32}', path.stem):
+                        continue
+                    try:
+                        with path.open(encoding='utf-8') as source:
+                            doc = json.load(source)
+                        pages = doc['pages']
+                        if not isinstance(pages, list):
+                            continue
+                        books.append({'id': path.stem, 'name': str(doc.get('name', 'Без названия')), 'pages': len(pages), 'characters': sum(len(p) for p in pages if isinstance(p, str)), 'created_at': doc.get('created_at', '')})
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+                return self.respond(200, {'books': books})
+            match = re.fullmatch(r'/library/([0-9a-f]{32})/page', parsed.path)
+            if match:
+                try:
+                    number = int(parse_qs(parsed.query).get('number', ['1'])[0])
+                    with (DATA_DIR / (match.group(1) + '.json')).open(encoding='utf-8') as source:
+                        doc = json.load(source)
+                    pages = doc['pages']
+                    if number < 1 or number > len(pages):
+                        return self.respond(404, {'error': 'Страница не найдена'})
+                    return self.respond(200, {'name': doc.get('name', ''), 'number': number, 'pages': len(pages), 'text': pages[number-1]})
+                except (OSError, ValueError, KeyError, TypeError):
+                    return self.respond(404, {'error': 'Книга не найдена'})
+            return self.respond(404, {'error': 'Не найдено'})
         def do_POST(self):
             if not self.authorized():
                 return self.respond(403, {'error': 'Нет доступа'})
