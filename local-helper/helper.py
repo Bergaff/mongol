@@ -13,7 +13,7 @@ from uuid import uuid4
 from pypdf import PdfReader
 
 MAX_SIZE = 50 * 1024 * 1024
-DATA_DIR = Path.home() / 'mongol-library'
+DATA_DIR = Path(__file__).resolve().parent.parent / '.local-data' / 'library'
 
 
 def run():

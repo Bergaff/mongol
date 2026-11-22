@@ -3,6 +3,12 @@ chcp 65001 >nul
 setlocal
 set PYTHONUTF8=1
 cd /d "%~dp0"
+set PYTHONDONTWRITEBYTECODE=1
+set PIP_NO_CACHE_DIR=1
+if not exist ".local-data\tmp" mkdir ".local-data\tmp"
+if not exist ".local-data\tmp" goto failed
+set "TEMP=%CD%\.local-data\tmp"
+set "TMP=%TEMP%"
 title Mongol - local helper
 echo =============================================
 echo  МОНГОЛ ХЭЛ: локальный помощник
