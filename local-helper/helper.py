@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from urllib.request import build_opener, ProxyHandler
+from urllib.error import URLError
 from uuid import uuid4
 from pypdf import PdfReader
 
@@ -63,6 +65,19 @@ def run():
             parsed = urlparse(self.path)
             if parsed.path == '/health':
                 return self.respond(200, {'ok': True})
+            if parsed.path == '/ollama/models':
+                try:
+                    # Fixed loopback address, no system proxy and no model downloads or inference.
+                    opener = build_opener(ProxyHandler({}))
+                    with opener.open('http://127.0.0.1:11434/api/tags', timeout=5) as response:
+                        data = json.loads(response.read(1024 * 1024 + 1))
+                    models = []
+                    for model in data.get('models', []):
+                        details = model.get('details') or {}
+                        models.append({'name': model.get('name', ''), 'size': model.get('size'), 'parameter_size': details.get('parameter_size', ''), 'quantization': details.get('quantization_level', '')})
+                    return self.respond(200, {'models': models})
+                except (URLError, OSError, ValueError, TypeError, AttributeError):
+                    return self.respond(502, {'error': 'Не удалось подключиться к Ollama. Запустите Ollama на этом компьютере и повторите попытку.'})
             if parsed.path == '/library':
                 books = []
                 for path in sorted(DATA_DIR.glob('*.json')):
