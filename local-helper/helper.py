@@ -20,6 +20,7 @@ from pypdf import PdfReader
 MAX_SIZE = 50 * 1024 * 1024
 DATA_DIR = Path(__file__).resolve().parent.parent / '.local-data' / 'library'
 ANALYSIS_DIR = DATA_DIR.parent / 'analyses'
+CHAPTER_DIR = DATA_DIR.parent / 'chapters'
 MODEL = 'qwen2.5:7b'
 MAX_PAGE_CHARS = 3500
 MAX_MULTI_PAGE_CHARS = 1600
@@ -47,6 +48,7 @@ def run():
     job_lock = Lock()
     current_job = {'id': None, 'stop': False}
     ANALYSIS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    CHAPTER_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def write_job(job):
         # Atomic replacement avoids leaving partial JSON when the process is interrupted.
@@ -103,7 +105,7 @@ def run():
                     current_job['id'] = None
                     current_job['stop'] = False
 
-    def book_snapshot(book_id, first, last):
+    def book_snapshot(book_id, first, last, allow_empty=False):
         with library_lock:
             with (DATA_DIR / (book_id + '.json')).open(encoding='utf-8') as source:
                 book = json.load(source)
@@ -124,7 +126,7 @@ def run():
                 fragment = text[offset:offset+BATCH_CHARS]
                 if fragment.strip():
                     chunks.append({'page': page_number, 'start': offset, 'end': offset+len(fragment)})
-        if not chunks:
+        if not chunks and not allow_empty:
             raise ValueError('В выбранном диапазоне нет извлечённого текста. Возможно, нужен OCR.')
         if len(chunks) > 2000:
             raise ValueError('Слишком большой диапазон. Выберите меньше страниц.')
@@ -262,7 +264,7 @@ def run():
                     labels = {'running':'в работе', 'stopped':'остановлено', 'completed':'завершено', 'error':'ошибка'}
                     name = str(job.get('book_name', 'Источник'))
                     lines = ['АНАЛИЗ ИСТОЧНИКА / ЧЕРНОВИК, ТРЕБУЕТ ПРОВЕРКИ',
-                             f'Книга: {name}', f'Выбраны страницы PDF: {job["page"]}–{job["end_page"]} включительно',
+                             f'Книга: {name}', f'Глава: {job.get("chapter_title") or "не указана"}', f'Выбраны страницы PDF: {job["page"]}–{job["end_page"]} включительно',
                              f'Готово частей: {count} из {len(parts)}; статус: {labels.get(job.get("status"), "прервано")}',
                              f'Модель: {job.get("model", "не указана")}',
                              'Одна страница может делиться на несколько частей. Выводы модели и номера страниц не проверены.',
@@ -305,6 +307,31 @@ def run():
                     return self.respond(200, {'index': index, 'page': part['page'], 'start': part['start'], 'end': part['end'], 'result': part.get('result', ''), 'elapsed_seconds': part.get('elapsed_seconds'), 'book_id': job['book_id'], 'book_name': job['book_name']})
                 except (OSError, ValueError, KeyError, TypeError, IndexError):
                     return self.respond(404, {'error': 'Результат не найден.'})
+            if parsed.path == '/chapters':
+                chapters = []
+                for path in sorted(CHAPTER_DIR.glob('*.json')):
+                    if not re.fullmatch(r'[0-9a-f]{32}', path.stem):
+                        continue
+                    try:
+                        with library_lock:
+                            with path.open(encoding='utf-8') as source:
+                                chapter = json.load(source)
+                        chapters.append({key: chapter.get(key) for key in ('id', 'title', 'book_id', 'book_name', 'page', 'end_page', 'created_at', 'empty_pages')})
+                    except (OSError, ValueError, AttributeError):
+                        continue
+                return self.respond(200, {'chapters': chapters})
+            chapter_page = re.fullmatch(r'/chapters/([0-9a-f]{32})/page', parsed.path)
+            if chapter_page:
+                try:
+                    number = int(parse_qs(parsed.query).get('number', ['0'])[0])
+                    with library_lock:
+                        with (CHAPTER_DIR / (chapter_page.group(1)+'.json')).open(encoding='utf-8') as source:
+                            chapter = json.load(source)
+                    if not chapter['page'] <= number <= chapter['end_page']:
+                        return self.respond(404, {'error': 'Страница не найдена в главе.'})
+                    return self.respond(200, {'title': chapter['title'], 'number': number, 'first': chapter['page'], 'last': chapter['end_page'], 'text': chapter['pages'][number-chapter['page']]})
+                except (OSError, ValueError, KeyError, TypeError, IndexError):
+                    return self.respond(404, {'error': 'Глава не найдена.'})
             if parsed.path == '/library':
                 books = []
                 for path in sorted(DATA_DIR.glob('*.json')):
@@ -337,6 +364,39 @@ def run():
             if not self.authorized():
                 return self.respond(403, {'error': 'Нет доступа'})
             parsed = urlparse(self.path)
+            if parsed.path == '/chapters/create':
+                try:
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if size < 1 or size > 4096:
+                        return self.respond(400, {'error': 'Некорректный запрос.'})
+                    body = json.loads(self.rfile.read(size))
+                    book_id, first, last, title = body.get('book_id'), body.get('page'), body.get('end_page'), body.get('title')
+                    if not isinstance(book_id, str) or not re.fullmatch(r'[0-9a-f]{32}', book_id) or type(first) is not int or type(last) is not int or not isinstance(title, str) or not title.strip() or len(title.strip()) > 150:
+                        return self.respond(400, {'error': 'Укажите книгу, название и диапазон страниц.'})
+                    book, selected, fingerprint, _, empty = book_snapshot(book_id, first, last, allow_empty=True)
+                    if sum(len(page) for page in selected) > 10000000:
+                        return self.respond(400, {'error': 'Слишком много текста. Выберите меньше страниц.'})
+                    chapter = {'id': uuid4().hex, 'title': title.strip(), 'book_id': book_id, 'book_name': str(book.get('name','Источник')), 'page': first, 'end_page': last, 'source_hash': fingerprint, 'pages': selected, 'empty_pages': empty, 'created_at': datetime.now(timezone.utc).isoformat()}
+                    target = CHAPTER_DIR / (chapter['id']+'.json')
+                    with library_lock:
+                        with target.open('x', encoding='utf-8') as out:
+                            json.dump(chapter, out, ensure_ascii=False)
+                        target.chmod(0o600)
+                    return self.respond(201, {'id': chapter['id']})
+                except ValueError as exc:
+                    return self.respond(400, {'error': str(exc)})
+                except (OSError, KeyError, TypeError):
+                    return self.respond(400, {'error': 'Не удалось создать главу. Проверьте книгу и диапазон.'})
+            chapter_delete = re.fullmatch(r'/chapters/([0-9a-f]{32})/delete', parsed.path)
+            if chapter_delete:
+                try:
+                    with library_lock:
+                        (CHAPTER_DIR / (chapter_delete.group(1)+'.json')).unlink()
+                    return self.respond(200, {'ok': True})
+                except FileNotFoundError:
+                    return self.respond(404, {'error': 'Глава не найдена.'})
+                except OSError:
+                    return self.respond(500, {'error': 'Не удалось удалить главу.'})
             if parsed.path == '/analysis/batch/start':
                 try:
                     size = int(self.headers.get('Content-Length', '0'))
@@ -350,8 +410,19 @@ def run():
                         if current_job['id']:
                             return self.respond(409, {'error': 'Анализ уже выполняется.'})
                         book, selected, fingerprint, parts, empty = book_snapshot(book_id, first, last)
+                        chapter_id = body.get('chapter_id')
+                        chapter_title = None
+                        if chapter_id is not None:
+                            if not isinstance(chapter_id, str) or not re.fullmatch(r'[0-9a-f]{32}', chapter_id):
+                                return self.respond(400, {'error': 'Некорректный идентификатор главы.'})
+                            with library_lock:
+                                with (CHAPTER_DIR / (chapter_id+'.json')).open(encoding='utf-8') as source:
+                                    chapter = json.load(source)
+                            if chapter.get('book_id') != book_id or chapter.get('page') != first or chapter.get('end_page') != last or chapter.get('source_hash') != fingerprint:
+                                return self.respond(409, {'error': 'Текст книги или диапазон главы изменился. Создайте главу заново или анализируйте страницы отдельно.'})
+                            chapter_title = str(chapter.get('title','Глава'))
                         job = {'id': uuid4().hex, 'kind': 'batch', 'book_id': book_id, 'book_name': str(book.get('name','Источник')), 'page': first, 'end_page': last,
-                               'model': MODEL, 'status': 'running', 'created_at': datetime.now(timezone.utc).isoformat(), 'source_hash': fingerprint,
+                               'model': MODEL, 'status': 'running', 'created_at': datetime.now(timezone.utc).isoformat(), 'source_hash': fingerprint, 'chapter_id': chapter_id, 'chapter_title': chapter_title,
                                'parts': parts, 'completed_parts': 0, 'empty_pages': empty}
                         write_job(job)
                         current_job['id'] = job['id']
