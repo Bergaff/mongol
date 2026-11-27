@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import sys
+import time
 from threading import Lock, Thread
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -154,13 +155,16 @@ def run():
                 payload = {'model': MODEL, 'prompt': prompt, 'stream': False, 'keep_alive': 0,
                            'options': {'num_ctx': 4096, 'num_predict': 450, 'num_thread': 4}}
                 request = Request('http://127.0.0.1:11434/api/generate', data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+                started = time.monotonic()
                 with opener.open(request, timeout=300) as response:
                     answer = json.loads(response.read(1024*1024+1))
+                elapsed_seconds = round(time.monotonic() - started, 2)
                 result = answer.get('response')
                 if answer.get('error') or not isinstance(result, str) or not result.strip():
                     raise ValueError('Ollama не вернула результат. Повторите незавершённую часть.')
                 with job_lock:
                     part['result'] = result
+                    part['elapsed_seconds'] = elapsed_seconds
                     job['completed_parts'] += 1
                     write_job(job)
                     if current_job['stop'] and job['completed_parts'] < len(job['parts']):
@@ -245,6 +249,49 @@ def run():
                         except (OSError, ValueError, TypeError):
                             continue
                 return self.respond(200, {'jobs': sorted(jobs, key=lambda x: x.get('created_at', ''), reverse=True)[:30]})
+            export_match = re.fullmatch(r'/analysis/([0-9a-f]{32})/export', parsed.path)
+            if export_match:
+                try:
+                    with job_lock:
+                        with (ANALYSIS_DIR / (export_match.group(1)+'.json')).open(encoding='utf-8') as source:
+                            job = json.load(source)
+                    if job.get('kind') != 'batch' or not job.get('completed_parts'):
+                        return self.respond(400, {'error': 'Пока нет готовых частей для копирования.'})
+                    parts = job['parts']
+                    count = job['completed_parts']
+                    labels = {'running':'в работе', 'stopped':'остановлено', 'completed':'завершено', 'error':'ошибка'}
+                    name = str(job.get('book_name', 'Источник'))
+                    lines = ['АНАЛИЗ ИСТОЧНИКА / ЧЕРНОВИК, ТРЕБУЕТ ПРОВЕРКИ',
+                             f'Книга: {name}', f'Выбраны страницы PDF: {job["page"]}–{job["end_page"]} включительно',
+                             f'Готово частей: {count} из {len(parts)}; статус: {labels.get(job.get("status"), "прервано")}',
+                             f'Модель: {job.get("model", "не указана")}',
+                             'Одна страница может делиться на несколько частей. Выводы модели и номера страниц не проверены.',
+                             'Время указывает длительность запроса к Ollama, включая загрузку модели, без пауз и времени на сохранение.']
+                    if job.get('empty_pages'):
+                        lines.append('Без извлечённого текста: страницы ' + ', '.join(str(p) for p in job['empty_pages']))
+                    page_stats = {}
+                    for part in parts[:count]:
+                        stat = page_stats.setdefault(part['page'], {'done':0, 'seconds':0.0, 'missing':False})
+                        stat['done'] += 1
+                        elapsed = part.get('elapsed_seconds')
+                        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                            stat['seconds'] += elapsed
+                        else:
+                            stat['missing'] = True
+                    if page_stats:
+                        lines.append('\nВРЕМЯ ПО СТРАНИЦАМ PDF (только готовые части):')
+                        for page_number, stat in page_stats.items():
+                            total = sum(1 for part in parts if part['page'] == page_number)
+                            duration = 'не измерено' if stat['missing'] else f'{stat["seconds"]:.1f} сек.'
+                            lines.append(f'Страница {page_number}: {duration}, готово частей {stat["done"]} из {total}')
+                    for index, part in enumerate(parts[:count], start=1):
+                        elapsed = part.get('elapsed_seconds')
+                        duration = f'{elapsed:.1f} сек.' if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else 'не измерено'
+                        lines.extend(['', f'ЧАСТЬ {index} ИЗ {len(parts)} / СТРАНИЦА PDF {part["page"]}',
+                                      f'Символы {part["start"]+1}–{part["end"]}; время запроса: {duration}', str(part.get('result', ''))])
+                    return self.respond(200, {'text': '\n'.join(lines)})
+                except (OSError, ValueError, KeyError, TypeError, IndexError):
+                    return self.respond(404, {'error': 'Не удалось подготовить результаты.'})
             part_match = re.fullmatch(r'/analysis/([0-9a-f]{32})/part', parsed.path)
             if part_match:
                 try:
@@ -255,7 +302,7 @@ def run():
                     if job.get('kind') != 'batch' or index < 1 or index > job.get('completed_parts', 0):
                         return self.respond(404, {'error': 'Результат этой части ещё не готов.'})
                     part = job['parts'][index-1]
-                    return self.respond(200, {'index': index, 'page': part['page'], 'start': part['start'], 'end': part['end'], 'result': part.get('result', ''), 'book_id': job['book_id'], 'book_name': job['book_name']})
+                    return self.respond(200, {'index': index, 'page': part['page'], 'start': part['start'], 'end': part['end'], 'result': part.get('result', ''), 'elapsed_seconds': part.get('elapsed_seconds'), 'book_id': job['book_id'], 'book_name': job['book_name']})
                 except (OSError, ValueError, KeyError, TypeError, IndexError):
                     return self.respond(404, {'error': 'Результат не найден.'})
             if parsed.path == '/library':
