@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import sys
+from threading import Lock
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +31,7 @@ def run():
     allowed_origin = f'{origin.scheme}://{origin.netloc}'
     token = secrets.token_urlsafe(32)
     DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    library_lock = Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -110,6 +112,16 @@ def run():
             if not self.authorized():
                 return self.respond(403, {'error': 'Нет доступа'})
             parsed = urlparse(self.path)
+            delete_match = re.fullmatch(r'/library/([0-9a-f]{32})/delete', parsed.path)
+            if delete_match:
+                try:
+                    with library_lock:
+                        (DATA_DIR / (delete_match.group(1) + '.json')).unlink()
+                    return self.respond(200, {'ok': True})
+                except FileNotFoundError:
+                    return self.respond(404, {'error': 'Книга не найдена'})
+                except OSError:
+                    return self.respond(500, {'error': 'Не удалось удалить запись'})
             if parsed.path != '/import':
                 return self.respond(404, {'error': 'Не найдено'})
             try:
@@ -119,17 +131,30 @@ def run():
                 data = self.rfile.read(size)
                 if not data.startswith(b'%PDF-'):
                     return self.respond(400, {'error': 'Ожидается PDF'})
-                reader = PdfReader(io.BytesIO(data))
-                if reader.is_encrypted:
-                    return self.respond(400, {'error': 'Зашифрованный PDF не поддерживается'})
-                pages = [page.extract_text() or '' for page in reader.pages]
+                checksum = hashlib.sha256(data).hexdigest()
                 name = Path(parse_qs(parsed.query).get('name', ['Источник.pdf'])[0]).name[:200]
-                doc = {'id': uuid4().hex, 'name': name, 'sha256': hashlib.sha256(data).hexdigest(), 'created_at': datetime.now(timezone.utc).isoformat(), 'pages': pages}
-                target = DATA_DIR / (doc['id'] + '.json')
-                with target.open('x', encoding='utf-8') as out:
-                    json.dump(doc, out, ensure_ascii=False)
-                target.chmod(0o600)
-                self.respond(200, {'name': name, 'pages': len(pages), 'characters': sum(map(len, pages)), 'empty_pages': sum(not p.strip() for p in pages)})
+                with library_lock:
+                    for existing in DATA_DIR.glob('*.json'):
+                        if not re.fullmatch(r'[0-9a-f]{32}', existing.stem):
+                            continue
+                        try:
+                            with existing.open(encoding='utf-8') as source:
+                                saved = json.load(source)
+                            if saved.get('sha256') == checksum and isinstance(saved.get('pages'), list):
+                                pages = saved['pages']
+                                return self.respond(200, {'name': name, 'pages': len(pages), 'characters': sum(len(p) for p in pages if isinstance(p, str)), 'empty_pages': sum(not p.strip() for p in pages if isinstance(p, str)), 'already_imported': True})
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            continue
+                    reader = PdfReader(io.BytesIO(data))
+                    if reader.is_encrypted:
+                        return self.respond(400, {'error': 'Зашифрованный PDF не поддерживается'})
+                    pages = [page.extract_text() or '' for page in reader.pages]
+                    doc = {'id': uuid4().hex, 'name': name, 'sha256': checksum, 'created_at': datetime.now(timezone.utc).isoformat(), 'pages': pages}
+                    target = DATA_DIR / (doc['id'] + '.json')
+                    with target.open('x', encoding='utf-8') as out:
+                        json.dump(doc, out, ensure_ascii=False)
+                    target.chmod(0o600)
+                self.respond(200, {'name': name, 'pages': len(pages), 'characters': sum(map(len, pages)), 'empty_pages': sum(not p.strip() for p in pages), 'already_imported': False})
             except Exception:
                 self.respond(400, {'error': 'Не удалось прочитать PDF. Проверьте файл.'})
     print(f'Адрес сайта: {allowed_origin}\nТокен подключения (не публикуйте): {token}\nБиблиотека: {DATA_DIR}\nДля остановки нажмите Ctrl+C', flush=True)
